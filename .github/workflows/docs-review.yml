@@ -1,0 +1,248 @@
+name: Docs Review
+
+# Reusable workflow: вызывается из репозитория с документацией.
+# Запускается на self-hosted раннере, зарегистрированном в docs-pipeline.
+on:
+  workflow_call:
+    inputs:
+      docs_pattern:
+        description: 'Regex (grep -E) для фильтрации изменённых файлов'
+        type: string
+        default: '^docs/(ru|en)/.+\.mdx$'
+      ru_path_filter:
+        description: 'Строка для grep — выбирает русские файлы из списка'
+        type: string
+        default: 'docs/ru'
+      en_path_filter:
+        description: 'Строка для grep — выбирает английские файлы из списка'
+        type: string
+        default: 'docs/en'
+    secrets:
+      LLM_API_KEY:
+        required: true
+      LLM_BASE_URL:
+        required: false
+      LLM_MODEL:
+        required: false
+      MCP_API_KEY:
+        required: false
+      MCP_SERVER_URL:
+        required: false
+
+concurrency:
+  group: docs-review-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  docs-review:
+    runs-on: self-hosted
+    timeout-minutes: 15
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      # ── 1. Checkout контентного репо (репо вызывающей стороны) ────
+      # github.repository здесь — это репо с документацией (doc-reviewer).
+      - name: Checkout content repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          path: content
+
+      # ── 2. Checkout сервисного репо (docs-pipeline) ───────────────
+      # Нужен для доступа к скриптам, стилям и стайлгайду.
+      # Репо docs-pipeline должно быть публичным (или задайте token ниже).
+      - name: Checkout pipeline repo
+        uses: actions/checkout@v4
+        with:
+          repository: amihailov76/docs-pipeline
+          ref: main
+          path: pipeline
+
+      # ── 3. Python ─────────────────────────────────────────────────
+      - name: Install Python deps
+        run: |
+          pip install -r pipeline/.github/scripts/requirements.txt --quiet
+
+      # ── 4. Vale ───────────────────────────────────────────────────
+      - name: Install Vale
+        run: |
+          VALE_VERSION="3.14.2"
+          curl -sL --max-time 120 \
+            "https://github.com/errata-ai/vale/releases/download/v${VALE_VERSION}/vale_${VALE_VERSION}_Windows_64-bit.zip" \
+            -o "$RUNNER_TEMP/vale.zip"
+          unzip -o "$RUNNER_TEMP/vale.zip" -d "$RUNNER_TEMP/vale-bin"
+          echo "$RUNNER_TEMP/vale-bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/vale-bin/vale" --version
+
+      # ── 4а. Диагностика Vale-конфигов ────────────────────────────
+      - name: Vale config diagnostics
+        run: |
+          PIPELINE="${GITHUB_WORKSPACE}/pipeline"
+          echo "=== .vale-ru.ini ===" && \
+            "$RUNNER_TEMP/vale-bin/vale" --config="$PIPELINE/.vale-ru.ini" ls-config 2>&1 | head -40 || true
+          echo "=== .vale-en.ini ===" && \
+            "$RUNNER_TEMP/vale-bin/vale" --config="$PIPELINE/.vale-en.ini" ls-config 2>&1 | head -40 || true
+
+      # ── 5. Определяем изменённые файлы ───────────────────────────
+      # Запускаем git diff из папки контентного репо.
+      # Пути в changed_files.txt — относительные без префикса content/.
+      - name: Get changed docs files
+        id: changed-files
+        working-directory: content
+        run: |
+          BASE="${{ github.base_ref || 'main' }}"
+          CHANGED=$(git diff --name-only "origin/${BASE}...HEAD" \
+            | grep -E '${{ inputs.docs_pattern }}' \
+            || true)
+          if [ -z "$CHANGED" ]; then
+            echo "No eligible docs files changed."
+            echo "has_files=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Changed files:"
+            echo "$CHANGED"
+            echo "$CHANGED" > "$RUNNER_TEMP/changed_files.txt"
+            echo "has_files=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── 6а. Python-линтер для русских файлов ─────────────────────
+      # Файлы передаём с префиксом content/ — так лежат на диске.
+      - name: Lint Russian files (Python)
+        if: steps.changed-files.outputs.has_files == 'true'
+        id: lint-ru
+        env:
+          MCP_SERVER_URL: ${{ secrets.MCP_SERVER_URL }}
+          MCP_API_KEY: ${{ secrets.MCP_API_KEY }}
+        run: |
+          RU_FILES=$(grep '${{ inputs.ru_path_filter }}' "$RUNNER_TEMP/changed_files.txt" 2>/dev/null | tr '\n' ' ' || true)
+          if [ -n "$RU_FILES" ]; then
+            PREFIXED=$(echo "$RU_FILES" | tr ' ' '\n' | sed 's|^|content/|' | tr '\n' ' ')
+            echo "[INFO] Проверяем русские файлы: $PREFIXED"
+            python "${GITHUB_WORKSPACE}/pipeline/.github/scripts/ru_linter.py" \
+              --files $PREFIXED \
+              --output "$RUNNER_TEMP/vale_ru.json" \
+              --styles-dir "${GITHUB_WORKSPACE}/pipeline/styles/Russian"
+          else
+            echo "[INFO] Русских файлов нет — пропускаем."
+            echo "{}" > "$RUNNER_TEMP/vale_ru.json"
+          fi
+
+      # ── 6б. Vale lint для английских файлов ──────────────────────
+      - name: Lint English files (Vale)
+        if: steps.changed-files.outputs.has_files == 'true'
+        id: lint-en
+        run: |
+          EN_FILES=$(grep '${{ inputs.en_path_filter }}' "$RUNNER_TEMP/changed_files.txt" 2>/dev/null | tr '\n' ' ' || true)
+          if [ -n "$EN_FILES" ]; then
+            PREFIXED=$(echo "$EN_FILES" | tr ' ' '\n' | sed 's|^|content/|' | tr '\n' ' ')
+            echo "[INFO] Проверяем английские файлы: $PREFIXED"
+            "$RUNNER_TEMP/vale-bin/vale" \
+              --config="${GITHUB_WORKSPACE}/pipeline/.vale-en.ini" \
+              --output=JSON $PREFIXED \
+              > "$RUNNER_TEMP/vale_en.json" \
+              2> "$RUNNER_TEMP/vale_en.err" \
+              || true
+            if [ -s "$RUNNER_TEMP/vale_en.err" ]; then
+              echo "[WARN] Vale EN stderr:"
+              cat "$RUNNER_TEMP/vale_en.err"
+            fi
+          else
+            echo "[INFO] Английских файлов нет — пропускаем."
+            echo "{}" > "$RUNNER_TEMP/vale_en.json"
+          fi
+
+      # ── 6в. Объединяем результаты + снимаем префикс content/ ─────
+      # Линтеры видели пути вида content/docs/ru/file.mdx.
+      # GitHub API и review-agent ожидают docs/ru/file.mdx.
+      - name: Merge lint results
+        if: steps.changed-files.outputs.has_files == 'true'
+        id: vale
+        run: |
+          python - "$RUNNER_TEMP/vale_ru.json" "$RUNNER_TEMP/vale_en.json" \
+            > "$RUNNER_TEMP/vale_output.json" << 'PYEOF'
+          import json, os, sys
+          merged = {}
+          for path in sys.argv[1:]:
+              if not os.path.exists(path):
+                  continue
+              try:
+                  text = open(path, encoding="utf-8").read().strip()
+                  if text.startswith("{"):
+                      merged.update(json.loads(text))
+                  elif text:
+                      print(f"[WARN] {path}: не JSON — пропущен", file=sys.stderr)
+              except Exception as e:
+                  print(f"[WARN] {path}: {e}", file=sys.stderr)
+
+          # Убираем префикс content/ из ключей — review-agent и GitHub API
+          # используют пути относительно корня контентного репо.
+          fixed = {}
+          for k, v in merged.items():
+              fixed_key = k[len("content/"):] if k.startswith("content/") else k
+              fixed[fixed_key] = v
+          print(json.dumps(fixed))
+          PYEOF
+
+          WARN_COUNT=$(python -c "
+          import json, sys
+          try:
+              d = json.load(open('$RUNNER_TEMP/vale_output.json'))
+              print(sum(len(v) for v in d.values() if isinstance(v, list)))
+          except: print(0)
+          " 2>/dev/null || echo 0)
+          echo "Всего предупреждений: $WARN_COUNT"
+
+      # ── 7. Health-check MCP-сервера ───────────────────────────────
+      - name: MCP server health check
+        if: steps.changed-files.outputs.has_files == 'true'
+        id: mcp-health
+        env:
+          MCP_SERVER_URL: ${{ secrets.MCP_SERVER_URL }}
+          MCP_API_KEY: ${{ secrets.MCP_API_KEY }}
+        run: |
+          STATUS="unavailable"
+          if [ -z "$MCP_SERVER_URL" ]; then
+            echo "MCP_SERVER_URL не задан, используем локальный стайлгайд."
+          else
+            for i in 1 2 3; do
+              HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+                -H "Authorization: Bearer $MCP_API_KEY" \
+                --max-time 10 \
+                "$MCP_SERVER_URL/health" 2>/dev/null || echo "000")
+              if [ "$HTTP_CODE" = "200" ]; then
+                STATUS="ok"; break
+              fi
+              echo "Попытка $i: HTTP $HTTP_CODE. Повтор через 10с..."
+              sleep 10
+            done
+          fi
+          echo "mcp_status=$STATUS" >> "$GITHUB_OUTPUT"
+          echo "MCP status: $STATUS"
+
+      # ── 8. LLM review agent ───────────────────────────────────────
+      # working-directory: content — чтобы агент читал файлы по путям
+      # из changed_files.txt (docs/ru/...) относительно корня контентного репо.
+      - name: Run LLM review agent
+        if: steps.changed-files.outputs.has_files == 'true'
+        working-directory: content
+        env:
+          LLM_API_KEY:    ${{ secrets.LLM_API_KEY }}
+          LLM_BASE_URL:   ${{ secrets.LLM_BASE_URL }}
+          LLM_MODEL:      ${{ secrets.LLM_MODEL }}
+          MCP_SERVER_URL: ${{ secrets.MCP_SERVER_URL }}
+          MCP_API_KEY:    ${{ secrets.MCP_API_KEY }}
+          MCP_STATUS:     ${{ steps.mcp-health.outputs.mcp_status }}
+          GITHUB_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER:      ${{ github.event.pull_request.number }}
+          REPO:           ${{ github.repository }}
+          BASE_REF:       ${{ github.base_ref || 'main' }}
+        run: |
+          python "${GITHUB_WORKSPACE}/pipeline/.github/scripts/review-agent.py" \
+            --changed-files "$RUNNER_TEMP/changed_files.txt" \
+            --vale-output "$RUNNER_TEMP/vale_output.json"
