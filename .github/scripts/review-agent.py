@@ -117,26 +117,33 @@ def fetch_style_guide_mcp(mcp_url, mcp_key, section=None):
     return json.dumps(data)
 
 
-def load_style_guide_local():
+def load_style_guide_local(style_guide_dir=None):
     """Load full style guide from local files."""
-    if not STYLE_GUIDE_DIR.exists():
+    sg_dir = Path(style_guide_dir) if style_guide_dir else STYLE_GUIDE_DIR
+    if not sg_dir.exists():
         return "(style guide unavailable)"
-    parts = [md.read_text(encoding="utf-8") for md in sorted(STYLE_GUIDE_DIR.glob("0*.md"))]
+    parts = [md.read_text(encoding="utf-8") for md in sorted(sg_dir.glob("0*.md"))]
+    if not parts:
+        # fallback: single file written by fetch-rules step from MCP
+        single = sg_dir / "styleguide.md"
+        if single.exists():
+            return single.read_text(encoding="utf-8")
     return "\n\n---\n\n".join(parts) if parts else "(style guide empty)"
 
 
-def get_style_guide(mcp_status, mcp_url, mcp_key):
-    """Load full style guide from MCP server or local fallback."""
-    if mcp_status == "ok" and mcp_url and mcp_key:
-        try:
-            guide = fetch_style_guide_mcp(mcp_url, mcp_key)
-            print("[OK] Style guide loaded from MCP server (all sections).")
-            return guide
-        except Exception as exc:
-            print(f"[WARN] MCP fetch failed ({exc}), using local fallback.")
+def get_style_guide(style_guide_dir=None):
+    """Load full style guide from the directory prepared by the fetch-rules step.
+
+    The fetch-rules workflow step already handled MCP vs local fallback,
+    so the agent just reads from the provided directory.
+    """
+    guide = load_style_guide_local(style_guide_dir)
+    src = style_guide_dir or str(STYLE_GUIDE_DIR)
+    if guide not in ("(style guide unavailable)", "(style guide empty)"):
+        print(f"[OK] Style guide loaded from {src}")
     else:
-        print("[INFO] MCP unavailable, using local style guide (all sections).")
-    return load_style_guide_local()
+        print(f"[WARN] Style guide is empty or missing at {src}")
+    return guide
 
 
 # ---------------------------------------------------------------------------
@@ -469,6 +476,8 @@ def main():
                         help="File with list of changed paths (one per line)")
     parser.add_argument("--vale-output", required=True,
                         help="Linter JSON output (Vale-compatible format)")
+    parser.add_argument("--style-guide-dir", default=None,
+                        help="Directory with style guide MD files (prepared by fetch-rules step)")
     args = parser.parse_args()
 
     token      = os.environ["GITHUB_TOKEN"]
@@ -528,7 +537,7 @@ def main():
 
     # fired_rules logged above; section filtering disabled — full guide always safer.
     # When style_guide grows past MAX_GUIDE, revisit RULE_SECTION_MAP filtering.
-    style_guide = get_style_guide(mcp_status, mcp_url, mcp_key)
+    style_guide = get_style_guide(args.style_guide_dir)
 
     print("[INFO] Reading full file contents...")
     file_contents = read_changed_files(changed_files)

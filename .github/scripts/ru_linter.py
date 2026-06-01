@@ -235,4 +235,54 @@ def lint_file(filepath, rules):
                 for m in pattern.finditer(raw_line):
                     if _overlaps(m.start(), m.end(), skip_ranges):
                         continue
-                    matched_text = m.group
+                    matched_text = m.group(0)
+                    msg = rule["message"].replace("%s", matched_text)
+                    if hint:
+                        msg += f"  →  {hint}"
+                    findings.append({
+                        "Action":  {"Name": rule["severity"]},
+                        "Check":   rule["name"],
+                        "Span":    [m.start() + 1, m.end()],
+                        "Line":    line_idx + 1,
+                        "Message": msg,
+                        "Link":    rule["link"],
+                        "Match":   matched_text,
+                    })
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Lint Russian MDX files using YAML rules."
+    )
+    parser.add_argument("--files", nargs="+", required=True,
+                        help="MDX files to lint")
+    parser.add_argument("--output", required=True,
+                        help="Output JSON path (Vale-compatible)")
+    parser.add_argument("--styles-dir", default="styles/Russian",
+                        help="Directory with YAML rule files")
+    args = parser.parse_args()
+
+    rules = load_rules(args.styles_dir)
+    if not rules:
+        print(f"[WARN] No rules loaded from {args.styles_dir}", file=sys.stderr)
+
+    results = {}
+    for filepath in args.files:
+        findings = lint_file(filepath, rules)
+        if findings:
+            results[filepath] = findings
+
+    with open(args.output, "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+
+    total = sum(len(v) for v in results.values())
+    print(f"[INFO] ru_linter: {total} issues in {len(results)} files.")
+
+
+if __name__ == "__main__":
+    main()
