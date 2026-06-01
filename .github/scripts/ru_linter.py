@@ -281,7 +281,16 @@ def main():
         json.dump(results, f, ensure_ascii=False, indent=2)
 
     total = sum(len(v) for v in results.values())
-    print(f"[INFO] ru_linter: {total} issues in {len(results)} files.")
+    print(f"[INFO] ru_linter: {total} issue(s) in {len(results)} file(s).")
+
+    for filepath, findings in results.items():
+        print(f"\n  {filepath}:")
+        for item in findings:
+            line  = item.get("Line", "?")
+            check = item.get("Check", "?")
+            match = item.get("Match", "")
+            msg   = item.get("Message", "")
+            print(f"    line {line}  [{check}]  \"{match}\"  —  {msg}")
 
 
 if __name__ == "__main__":
